@@ -7,7 +7,11 @@ const { GoogleGenerativeAI } = require('@google/generative-ai');
 const app = express();
 
 // 基础中间件配置
-app.use(cors());
+app.use(cors({
+  origin: '*',
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization']
+}));
 app.use(express.json({ limit: '10mb' }));
 
 // 初始化云服务客户端（从环境变量读取安全密钥）
