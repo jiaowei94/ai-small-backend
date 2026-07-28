@@ -6,12 +6,11 @@ const { GoogleGenerativeAI } = require('@google/generative-ai');
 
 const app = express();
 
+// 1. 彻底解决跨域预检跳转问题 (CORS 强制无条件放行)
+app.use(cors());
+app.options('*', cors());
+
 // 基础中间件配置
-app.use(cors({
-  origin: '*',
-  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization']
-}));
 app.use(express.json({ limit: '10mb' }));
 
 // 初始化云服务客户端（从环境变量读取安全密钥）
@@ -22,12 +21,12 @@ const supabase = createClient(
 const resend = new Resend(process.env.RESEND_API_KEY || '');
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY || '');
 
-// 1. 基础健康检查接口
+// 2. 基础健康检查接口
 app.get('/', (req, res) => {
   res.status(200).send('AI-Small Backend Service is Running on Vercel!');
 });
 
-// 2. 发送邮件验证码接口 (/api/auth/send-code)
+// 3. 发送邮件验证码接口 (/api/auth/send-code)
 app.post('/api/auth/send-code', async (req, res) => {
   const { email } = req.body;
   if (!email) return res.status(400).json({ error: 'Email is required' });
@@ -46,7 +45,7 @@ app.post('/api/auth/send-code', async (req, res) => {
   }
 });
 
-// 3. 智能膳食识别接口 (/api/diet/analyze)
+// 4. 智能膳食识别接口 (/api/diet/analyze)
 app.post('/api/diet/analyze', async (req, res) => {
   const { imageBase64 } = req.body;
   if (!imageBase64) return res.status(400).json({ error: 'Image data required' });
@@ -72,5 +71,5 @@ app.post('/api/diet/analyze', async (req, res) => {
   }
 });
 
-// 关键修正：导出 app 对象以完美适配 Vercel 的云函数环境
+// 导出 app 对象以完美适配 Vercel 的云函数环境
 module.exports = app;
