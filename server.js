@@ -10,15 +10,19 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// 2. 初始化云服务 SDK
-const supabaseUrl = process.env.SUPABASE_URL || "https://zcvgirshnyqenkjknrci.supabase.co";
-const supabaseKey = process.env.SUPABASE_KEY || "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InpjdmdpcnNobnlxZW5ramtucmNpIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc4NTEwMTE0NywiZXhwIjoyMTAwNjc3MTQ3fQ.MHZpy2CQfm-bvNKPxSNG4MRByC3Dkf5R1EDhYdHUNSQ";
-const resendApiKey = process.env.RESEND_API_KEY || "re_QPmo5f4U_MVjSYUxWKL65LAnwWEXWxQx3";
+// 2. 从环境变量安全读取凭证（安全防范：绝不硬编码敏感 Key）
+const supabaseUrl = process.env.SUPABASE_URL;
+const supabaseKey = process.env.SUPABASE_KEY; // service_role 密钥
+const resendApiKey = process.env.RESEND_API_KEY;
 
-const supabase = createClient(supabaseUrl, supabaseKey);
-const resend = new Resend(resendApiKey);
+if (!supabaseUrl || !supabaseKey || !resendApiKey) {
+  console.warn("⚠️ 警告: 存在未配置的环境变量，请检查 Vercel 后台 Environment Variables 设置！");
+}
 
-// 内存保存验证码临时状态 (生产环境建议存 Redis，内存存取适配免费 Serverless 节点测试)
+const supabase = createClient(supabaseUrl || '', supabaseKey || '');
+const resend = new Resend(resendApiKey || '');
+
+// 内存保存验证码临时状态 (内存存取适配 Serverless 节点)
 const otpStore = new Map();
 
 // 健康检查路由
@@ -28,7 +32,7 @@ app.get('/', (req, res) => {
 
 /**
  * API: 发送验证码
- * 适用场景：新用户注册、忘记密码（找回密码）
+ * 适用场景：新用户注册、找回密码
  */
 app.post('/api/auth/send-code', async (req, res) => {
   try {
