@@ -2,170 +2,245 @@ const express = require('express');
 const cors = require('cors');
 const { createClient } = require('@supabase/supabase-js');
 const { Resend } = require('resend');
-const crypto = require('crypto');
+require('dotenv').config();
 
 const app = express();
 
-// 跨域与 JSON 解析中间件
+// 1. 中间件配置
 app.use(cors());
 app.use(express.json());
 
-// 初始化 Supabase 客户端 (使用最高权限 service_role 写入 users 表)
-const supabaseUrl = process.env.SUPABASE_URL;
-const supabaseKey = process.env.SUPABASE_KEY;
+// 2. 初始化云服务 SDK
+const supabaseUrl = process.env.SUPABASE_URL || "https://zcvgirshnyqenkjknrci.supabase.co";
+const supabaseKey = process.env.SUPABASE_KEY || "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InpjdmdpcnNobnlxZW5ramtucmNpIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc4NTEwMTE0NywiZXhwIjoyMTAwNjc3MTQ3fQ.MHZpy2CQfm-bvNKPxSNG4MRByC3Dkf5R1EDhYdHUNSQ";
+const resendApiKey = process.env.RESEND_API_KEY || "re_QPmo5f4U_MVjSYUxWKL65LAnwWEXWxQx3";
+
 const supabase = createClient(supabaseUrl, supabaseKey);
+const resend = new Resend(resendApiKey);
 
-// 初始化 Resend 邮件服务客户端
-const resend = new Resend(process.env.RESEND_API_KEY);
+// 内存保存验证码临时状态 (生产环境建议存 Redis，内存存取适配免费 Serverless 节点测试)
+const otpStore = new Map();
 
-// 内存暂存验证码 (存储格式: Map<email, { code, expiresAt }>)
-const codeStore = new Map();
-
-// 服务健康检查根接口
+// 健康检查路由
 app.get('/', (req, res) => {
   res.send('AI-Small Backend Service is Running on Vercel!');
 });
 
 /**
- * API 1: 发送邮箱验证码 (/api/auth/send-code)
+ * API: 发送验证码
+ * 适用场景：新用户注册、忘记密码（找回密码）
  */
 app.post('/api/auth/send-code', async (req, res) => {
   try {
-    const { email } = req.body;
-    if (!email || !email.includes('@')) {
-      return res.status(400).json({ success: false, error: '请输入有效的邮箱地址' });
+    const { email, type } = req.body; // type: 'register' | 'reset_password'
+    if (!email) {
+      return res.status(400).json({ success: false, message: '请提供有效的邮箱地址' });
     }
 
-    // 生成 6 位随机数字验证码
+    // 校验该邮箱是否已注册
+    const { data: existingUser } = await supabase
+      .from('users')
+      .select('id')
+      .eq('email', email)
+      .single();
+
+    if (type === 'register' && existingUser) {
+      return res.status(400).json({ success: false, message: '该邮箱已被注册，请直接登录' });
+    }
+
+    if (type === 'reset_password' && !existingUser) {
+      return res.status(400).json({ success: false, message: '该邮箱尚未注册，请先注册账号' });
+    }
+
+    // 生成 6 位随机验证码
     const code = Math.floor(100000 + Math.random() * 900000).toString();
-    const expiresAt = Date.now() + 5 * 60 * 1000; // 5 分钟有效
+    
+    // 保存至内存中，有效期 5 分钟
+    otpStore.set(email, {
+      code,
+      expiresAt: Date.now() + 5 * 60 * 1000
+    });
 
-    // 存入内存
-    codeStore.set(email.toLowerCase(), { code, expiresAt });
-
-    // 调用 Resend API 发送邮件
-    const sendResult = await resend.emails.send({
-      from: 'ai-small <onboarding@resend.dev>',
+    // 调用 Resend API 发送邮件（兼容 QQ 邮箱等国内服务商）
+    const subjectTitle = type === 'register' ? '注册验证码' : '重置密码验证码';
+    await resend.emails.send({
+      from: 'AI-Small Team <no-reply@ai-small.xyz>',
       to: [email],
-      subject: '【ai-small.xyz】您的登录验证码',
+      subject: `【AI-Small】您的${subjectTitle}`,
       html: `
-        <div style="font-family: Arial, sans-serif; padding: 20px; color: #333;">
-          <h2>欢迎使用 ai-small.xyz</h2>
-          <p>您的登录验证码为：</p>
-          <div style="font-size: 32px; font-weight: bold; color: #4F46E5; letter-spacing: 4px; margin: 20px 0;">
+        <div style="padding: 20px; font-family: sans-serif; line-height: 1.6; color: #333;">
+          <h2 style="color: #2563eb;">AI-Small 验证服务</h2>
+          <p>您好！您正在进行 <strong>${subjectTitle}</strong> 操作。</p>
+          <p>您的动态验证码为：</p>
+          <div style="background: #f3f4f6; padding: 12px 24px; font-size: 24px; font-weight: bold; letter-spacing: 4px; color: #2563eb; display: inline-block; border-radius: 6px; margin: 10px 0;">
             ${code}
           </div>
-          <p>验证码有效期为 5 分钟，请勿泄露给其他人。</p>
+          <p>验证码有效期为 5 分钟。如非本人操作，请忽略此邮件。</p>
         </div>
       `
     });
 
-    if (sendResult.error) {
-      console.error('Resend 发送错误:', sendResult.error);
-      return res.status(500).json({ success: false, error: '邮件发送失败，请稍后重试' });
-    }
-
-    return res.json({ success: true, message: '验证码已成功发送至您的邮箱' });
-  } catch (err) {
-    console.error('发送验证码异常:', err);
-    return res.status(500).json({ success: false, error: err.message || '服务器内部错误' });
+    return res.json({ success: true, message: '验证码已发送，请检查您的邮箱（包含垃圾邮件箱）' });
+  } catch (error) {
+    console.error('Send Code Error:', error);
+    return res.status(500).json({ success: false, message: '验证码发送失败: ' + error.message });
   }
 });
 
 /**
- * API 2: 校验验证码并完成注册/登录 (/api/auth/verify)
+ * API: 注册账号 (需输入密码 + 验证码)
  */
-app.post('/api/auth/verify', async (req, res) => {
+app.post('/api/auth/register', async (req, res) => {
   try {
-    const { email, code } = req.body;
-    if (!email || !code) {
-      return res.status(400).json({ success: false, error: '邮箱和验证码不能为空' });
+    const { email, password, code, nickname } = req.body;
+
+    if (!email || !password || !code) {
+      return res.status(400).json({ success: false, message: '请完整填写邮箱、密码与验证码' });
     }
 
-    const normalizedEmail = email.toLowerCase();
-    const record = codeStore.get(normalizedEmail);
-
-    if (!record) {
-      return res.status(400).json({ success: false, error: '未找到验证码记录或验证码已失效' });
+    // 校验验证码
+    const record = otpStore.get(email);
+    if (!record || record.code !== code || Date.now() > record.expiresAt) {
+      return res.status(400).json({ success: false, message: '验证码无效或已过期' });
     }
 
-    if (Date.now() > record.expiresAt) {
-      codeStore.delete(normalizedEmail);
-      return res.status(400).json({ success: false, error: '验证码已过期，请重新获取' });
+    // 在 Supabase 创建 Auth 用户
+    const { data: authData, error: authError } = await supabase.auth.admin.createUser({
+      email,
+      password,
+      email_confirm: true
+    });
+
+    if (authError) {
+      return res.status(400).json({ success: false, message: authError.message });
     }
 
-    if (record.code !== code.toString().trim()) {
-      return res.status(400).json({ success: false, error: '验证码输入错误' });
-    }
+    const userId = authData.user.id;
 
-    // 验证成功，清除内存记录
-    codeStore.delete(normalizedEmail);
-
-    // 查询 Supabase users 表是否存在该用户
-    let { data: existingUser, error: queryError } = await supabase
+    // 写入 public.users 业务扩展信息表
+    const { error: dbError } = await supabase
       .from('users')
-      .select('*')
-      .eq('email', normalizedEmail)
-      .maybeSingle();
+      .insert([
+        {
+          id: userId,
+          email,
+          nickname: nickname || email.split('@')[0],
+          avatar_url: 'https://api.dicebear.com/7.x/bottts/svg?seed=' + userId
+        }
+      ]);
 
-    if (queryError) {
-      console.error('查询 Supabase 失败:', queryError);
+    if (dbError) {
+      return res.status(500).json({ success: false, message: '用户初始化失败: ' + dbError.message });
     }
 
-    let user = existingUser;
+    // 验证成功后删除验证码记录
+    otpStore.delete(email);
 
-    // 若用户不存在则新建落盘
-    if (!user) {
-      const newUserId = crypto.randomUUID();
-      const nickname = normalizedEmail.split('@')[0];
-      const avatarUrl = `https://api.dicebear.com/7.x/bottts/svg?seed=${nickname}`;
+    return res.json({
+      success: true,
+      message: '注册成功！请登录',
+      user: { id: userId, email, nickname }
+    });
+  } catch (error) {
+    console.error('Register Error:', error);
+    return res.status(500).json({ success: false, message: '注册失败: ' + error.message });
+  }
+});
 
-      const { data: newUser, error: insertError } = await supabase
-        .from('users')
-        .insert([{
-          id: newUserId,
-          email: normalizedEmail,
-          nickname: nickname,
-          avatar_url: avatarUrl
-        }])
-        .select()
-        .single();
+/**
+ * API: 密码登录 (日常登录，无需验证码)
+ */
+app.post('/api/auth/login', async (req, res) => {
+  try {
+    const { email, password } = req.body;
 
-      if (insertError) {
-        console.error('创建用户落盘失败:', insertError);
-        return res.status(500).json({ success: false, error: '数据库写入失败: ' + insertError.message });
-      }
-
-      user = newUser;
+    if (!email || !password) {
+      return res.status(400).json({ success: false, message: '请输入邮箱与密码' });
     }
 
-    // 生成前端持久化 Token
-    const authToken = `token_${user.id}_${Date.now()}`;
+    // 校验账号密码
+    const { data, error } = await supabase.auth.signInWithPassword({
+      email,
+      password
+    });
+
+    if (error) {
+      return res.status(401).json({ success: false, message: '账号或密码错误' });
+    }
+
+    // 查询扩展个人信息
+    const { data: userInfo } = await supabase
+      .from('users')
+      .select('id, email, nickname, avatar_url')
+      .eq('id', data.user.id)
+      .single();
 
     return res.json({
       success: true,
       message: '登录成功',
-      token: authToken,
-      user: {
-        id: user.id,
-        email: user.email,
-        nickname: user.nickname,
-        avatar_url: user.avatar_url
-      }
+      token: data.session.access_token,
+      user: userInfo || { id: data.user.id, email: data.user.email }
     });
-
-  } catch (err) {
-    console.error('校验登录异常:', err);
-    return res.status(500).json({ success: false, error: err.message || '服务器内部错误' });
+  } catch (error) {
+    console.error('Login Error:', error);
+    return res.status(500).json({ success: false, message: '登录失败: ' + error.message });
   }
 });
 
-// 本地开发监听与 Vercel Serverless 导出兼容
-const PORT = process.env.PORT || 10000;
+/**
+ * API: 重置/找回密码 (需验证码)
+ */
+app.post('/api/auth/reset-password', async (req, res) => {
+  try {
+    const { email, code, newPassword } = req.body;
+
+    if (!email || !code || !newPassword) {
+      return res.status(400).json({ success: false, message: '请完整填写参数' });
+    }
+
+    // 校验验证码
+    const record = otpStore.get(email);
+    if (!record || record.code !== code || Date.now() > record.expiresAt) {
+      return res.status(400).json({ success: false, message: '验证码错误或已过期' });
+    }
+
+    // 根据邮箱获取用户 ID
+    const { data: userData } = await supabase
+      .from('users')
+      .select('id')
+      .eq('email', email)
+      .single();
+
+    if (!userData) {
+      return res.status(404).json({ success: false, message: '未找到该用户' });
+    }
+
+    // 更新用户密码
+    const { error: updateError } = await supabase.auth.admin.updateUserById(
+      userData.id,
+      { password: newPassword }
+    );
+
+    if (updateError) {
+      return res.status(500).json({ success: false, message: updateError.message });
+    }
+
+    otpStore.delete(email);
+
+    return res.json({ success: true, message: '密码重置成功，请使用新密码登录！' });
+  } catch (error) {
+    console.error('Reset Password Error:', error);
+    return res.status(500).json({ success: false, message: '重置密码失败: ' + error.message });
+  }
+});
+
+// Vercel Serverless 入口暴露
+module.exports = app;
+
+// 本地开发启动服务
 if (require.main === module) {
+  const PORT = process.env.PORT || 10000;
   app.listen(PORT, () => {
     console.log(`Server listening on port ${PORT}`);
   });
 }
-
-module.exports = app;
