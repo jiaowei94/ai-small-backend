@@ -2,6 +2,7 @@ const express = require('express');
 const cors = require('cors');
 const { createClient } = require('@supabase/supabase-js');
 const { Resend } = require('resend');
+const { GoogleGenerativeAI } = require('@google/generative-ai');
 require('dotenv').config();
 
 const app = express();
@@ -10,9 +11,11 @@ const PORT = process.env.PORT || 10000;
 app.use(cors({ origin: '*' }));
 app.use(express.json({ limit: '10mb' }));
 
+// 初始化云端服务客户端
 const supabaseUrl = process.env.SUPABASE_URL;
 const supabaseKey = process.env.SUPABASE_KEY;
 const resendKey = process.env.RESEND_API_KEY;
+const geminiKey = process.env.GEMINI_API_KEY;
 
 let supabase = null;
 if (supabaseUrl && supabaseKey) {
@@ -24,13 +27,20 @@ if (resendKey) {
     resend = new Resend(resendKey);
 }
 
+let genAI = null;
+if (geminiKey) {
+    genAI = new GoogleGenerativeAI(geminiKey);
+}
+
+// 内存验证码缓存
 const verificationStore = new Map();
 
+// 基础健康检查
 app.get('/', (req, res) => {
     res.status(200).send('AI-Small Backend Service is Running on Vercel!');
 });
 
-// 1. POST /api/auth/send-code
+// 1. POST /api/auth/send-code (发信接口)
 app.post('/api/auth/send-code', async (req, res) => {
     try {
         const { email } = req.body;
@@ -38,144 +48,102 @@ app.post('/api/auth/send-code', async (req, res) => {
             return res.status(400).json({ success: false, message: '请提供有效的邮箱地址' });
         }
 
-        const cleanEmail = email.toLowerCase().trim();
         const code = Math.floor(100000 + Math.random() * 900000).toString();
-        const expiresAt = Date.now() + 5 * 60 * 1000;
-
-        verificationStore.set(cleanEmail, { code, expiresAt });
+        verificationStore.set(email.toLowerCase(), { code, expires: Date.now() + 5 * 60 * 1000 });
 
         if (resend) {
             await resend.emails.send({
-                from: 'NEXUS Security <onboarding@resend.dev>',
-                to: [cleanEmail],
-                subject: '【NEXUS AI】您的注册登录验证码',
-                html: `
-                    <div style="padding: 24px; font-family: sans-serif; background: #f8fafc; border-radius: 16px;">
-                        <h2 style="color: #0284c7; margin-bottom: 8px;">NEXUS AI 协同平台</h2>
-                        <p style="color: #334155;">您好！您本次操作的验证码为：</p>
-                        <div style="background: #ffffff; padding: 16px; border-radius: 8px; display: inline-block; border: 1px solid #e2e8f0; margin: 12px 0;">
-                            <span style="color: #06b6d4; font-size: 32px; font-weight: bold; letter-spacing: 6px;">${code}</span>
-                        </div>
-                        <p style="color: #64748b; font-size: 12px; margin-top: 12px;">验证码有效期为 5 分钟，如非本人操作请忽略此邮件。</p>
-                    </div>
-                `
+                from: 'AI-Small <onboarding@resend.dev>',
+                to: [email],
+                subject: '【ai-small.xyz】您的登录验证码',
+                html: `<p>您的验证码是：<strong>${code}</strong>，5分钟内有效。</p>`
             });
-        } else {
-            console.log(`[DEV MODE] Verification Code for ${cleanEmail}: ${code}`);
         }
 
-        return res.status(200).json({
-            success: true,
-            message: '验证码发送成功！'
-        });
-    } catch (error) {
-        console.error('Send Code Error:', error);
-        return res.status(500).json({
-            success: false,
-            message: '验证码发送失败: ' + (error.message || '系统繁忙')
-        });
+        return res.status(200).json({ success: true, message: '验证码已发送' });
+    } catch (err) {
+        console.error('Send code error:', err);
+        return res.status(500).json({ success: false, message: '服务端发信失败' });
     }
 });
 
-// 2. POST /api/auth/verify
+// 2. POST /api/auth/verify (校验接口)
 app.post('/api/auth/verify', async (req, res) => {
     try {
-        const { email, password, code, mode } = req.body;
-
-        if (!email) {
-            return res.status(400).json({ success: false, message: '缺少邮箱信息' });
+        const { email, code } = req.body;
+        if (!email || !code) {
+            return res.status(400).json({ success: false, message: '邮箱和验证码不能为空' });
         }
 
-        const cleanEmail = email.toLowerCase().trim();
-
-        if (mode === 'code') {
-            if (!code) {
-                return res.status(400).json({ success: false, message: '请输入验证码' });
-            }
-
-            const record = verificationStore.get(cleanEmail);
-            if (!record) {
-                return res.status(400).json({ success: false, message: '验证码不存在或已过期，请重新获取' });
-            }
-
-            if (Date.now() > record.expiresAt) {
-                verificationStore.delete(cleanEmail);
-                return res.status(400).json({ success: false, message: '验证码已过期，请重新发送' });
-            }
-
-            if (record.code !== code.trim()) {
-                return res.status(400).json({ success: false, message: '验证码错误' });
-            }
-
-            verificationStore.delete(cleanEmail);
-        } else if (mode === 'password') {
-            if (!password) {
-                return res.status(400).json({ success: false, message: '请输入密码' });
-            }
+        const record = verificationStore.get(email.toLowerCase());
+        if (!record || record.code !== code || Date.now() > record.expires) {
+            return res.status(400).json({ success: false, message: '验证码无效或已过期' });
         }
 
-        let userId = 'user_' + Date.now();
-        let userNickname = cleanEmail.split('@')[0];
+        verificationStore.delete(email.toLowerCase());
 
+        let userId = null;
         if (supabase) {
-            try {
-                const { data: existingUser } = await supabase
-                    .from('users')
-                    .select('*')
-                    .eq('email', cleanEmail)
-                    .single();
-
-                if (existingUser) {
-                    userId = existingUser.id;
-                    userNickname = existingUser.nickname || userNickname;
-                } else {
-                    const crypto = require('crypto');
-                    const newUuid = crypto.randomUUID();
-                    const { data: newUser, error: createError } = await supabase
-                        .from('users')
-                        .insert([
-                            { id: newUuid, email: cleanEmail, nickname: userNickname }
-                        ])
-                        .select()
-                        .single();
-
-                    if (!createError && newUser) {
-                        userId = newUser.id;
-                    } else {
-                        userId = newUuid;
-                    }
-                }
-            } catch (dbErr) {
-                console.warn('Supabase DB Access Warning:', dbErr.message);
+            const { data: existingUser } = await supabase.from('users').select('id').eq('email', email).single();
+            if (existingUser) {
+                userId = existingUser.id;
+            } else {
+                const newId = crypto.randomUUID();
+                const { data: insertedUser } = await supabase.from('users').insert([{ id: newId, email, nickname: email.split('@')[0] }]).select().single();
+                if (insertedUser) userId = insertedUser.id;
             }
         }
-
-        const token = 'nexus_token_' + Buffer.from(cleanEmail + ':' + Date.now()).toString('base64');
 
         return res.status(200).json({
             success: true,
-            message: '认证成功',
-            token,
-            user: {
-                id: userId,
-                email: cleanEmail,
-                nickname: userNickname
-            }
+            token: `token_${Date.now()}`,
+            user: { id: userId, email }
         });
+    } catch (err) {
+        console.error('Verify error:', err);
+        return res.status(500).json({ success: false, message: '服务端校验异常' });
+    }
+});
 
-    } catch (error) {
-        console.error('Auth Verify Error:', error);
-        return res.status(500).json({
-            success: false,
-            message: '系统验证过程异常: ' + error.message
-        });
+// 3. 【新增接口】POST /api/ai/chat (Gemini 免登录 AI 对话)
+app.post('/api/ai/chat', async (req, res) => {
+    try {
+        const { message } = req.body;
+        if (!message) {
+            return res.status(400).json({ success: false, message: '消息内容不能为空' });
+        }
+
+        if (!genAI) {
+            return res.status(200).json({ success: true, reply: "【演示回复】服务器未配置 GEMINI_API_KEY 环境变量，已收到消息：" + message });
+        }
+
+        const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
+        const result = await model.generateContent(message);
+        const response = await result.response;
+        const text = response.text();
+
+        return res.status(200).json({ success: true, reply: text });
+    } catch (err) {
+        console.error('Gemini AI error:', err);
+        return res.status(500).json({ success: false, message: 'AI 大模型响应失败' });
+    }
+});
+
+// 4. 【新增接口】POST /api/game/score (记录小游戏得分)
+app.post('/api/game/score', async (req, res) => {
+    try {
+        const { userId, gameId, score } = req.body;
+        if (supabase && userId && gameId) {
+            await supabase.from('game_scores').insert([{ user_id: userId, game_id: gameId, score: parseInt(score) }]);
+        }
+        return res.status(200).json({ success: true, message: '得分记录成功' });
+    } catch (err) {
+        return res.status(500).json({ success: false, message: '高分榜保存失败' });
     }
 });
 
 module.exports = app;
 
-if (require.main === module) {
-    app.listen(PORT, () => {
-        console.log(`Server is running locally on http://localhost:${PORT}`);
-    });
+if (process.env.NODE_ENV !== 'production') {
+    app.listen(PORT, () => console.log(`Backend running on http://localhost:${PORT}`));
 }
